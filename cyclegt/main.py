@@ -1,27 +1,34 @@
-import tqdm
-import random
-import yaml
 import argparse
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim
-import torch.nn.functional as F
-import json
-from sklearn.metrics import f1_score
 from collections import defaultdict
 import copy
+import json
+import logging
+import numpy as np
 from pycocoevalcap.bleu.bleu import Bleu
 from pycocoevalcap.rouge.rouge import Rouge
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.meteor.meteor import Meteor
+import random
+from sklearn.metrics import f1_score
+import torch
+import torch.nn as nn
+import torch.optim
+import torch.nn.functional as F
+from transformers.optimization import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup	
+import tqdm
+import yaml
 
-from t2g_model import ModelLSTM
-from g2t_model import GraphWriter
-from data import write_txt, tensor2data_g2t, tensor2data_t2g, batch2tensor_t2g, batch2tensor_g2t, \
-    scan_data, DataPool, fill_pool
+from cyclegt.models.t2g_model import ModelLSTM
+from cyclegt.models.g2t_model import GraphWriter
+from cyclegt.data.data import (
+    write_txt, 
+    tensor2data_g2t,
+    tensor2data_t2g, 
+    batch2tensor_t2g, 
+    batch2tensor_g2t,
+    scan_data
+)
 
-import logging
 logging.basicConfig(level=logging.INFO)
 logging.info('Start Logging')
 bleu = Bleu(4)
@@ -29,67 +36,12 @@ meteor = Meteor()
 rouge = Rouge()
 cider = Cider()
 
-def fake_sent(x):
-    return ' '.join(['<ENT_{0:}>'.format(xx) for xx in range(len(x))])
-
-def prep_data(config, load=""):
-    #prep data always has two steps, build the vocabulary first and then generate data samples
-    train_raw = json.load(open(config['train_file'], 'r'))
-    max_len = sorted([len(x['text'].split()) for x in train_raw])[int(0.95*len(train_raw))]
-    train_raw = [x for x in train_raw if len(x['text'].split())<max_len]
-    train_raw = train_raw[:int(len(train_raw)*config['split'])]
-    
-    dev_raw = json.load(open(config['dev_file'], 'r'))
-    test_raw = json.load(open(config['test_file'], 'r'))
-    if len(load)==0:
-        # scan the data and create vocabulary
-        vocab = scan_data(train_raw)
-        vocab = scan_data(dev_raw, vocab)
-        vocab = scan_data(test_raw, vocab, sp=True)
-        for v in vocab.values():
-            v.build()
-            logging.info('Vocab Size {0:}, detached by test set {1:}'.format(len(v), len(v.sp)))
-        return vocab
-    else:
-        vocab = torch.load(load)['vocab']
-
-    logging.info('MAX_LEN {0:}'.format(max_len))
-    pool = DataPool()
-    _raw = []
-    for x in train_raw:
-        _x = copy.deepcopy(x)
-        if config['mode']=='sup':
-            _raw.append(_x)
-        else: #make sure that no information leak in unsupervised settings
-            _x['relations'] = []
-            _raw.append(_x)
-
-    fill_pool(pool, vocab, _raw, 'train_g2t')
-    _raw = []
-    for x in train_raw:
-        _x = copy.deepcopy(x)
-        if config['mode']=='sup':
-            _raw.append(_x)
-        else: #make sure that no information leak in unsupervised settings
-            _x['text'] = fake_sent(_x['entities'])
-            _raw.append(_x)
-
-    fill_pool(pool, vocab, _raw, 'train_t2g')
-    _raw = []
-    for x in dev_raw:
-        _x = copy.deepcopy(x)
-        _x['text'] = fake_sent(_x['entities'])
-        _raw.append(_x)
-
-    fill_pool(pool, vocab, dev_raw, 'dev')
-    fill_pool(pool, vocab, _raw, 'dev_t2g_blind') # prepare for the entity2graph setting
-    fill_pool(pool, vocab, test_raw, 'test')
-    return pool, vocab
 
 def prep_model(config, vocab):
     g2t_model = GraphWriter(copy.deepcopy(config['g2t']), vocab)
     t2g_model = ModelLSTM(relation_types=len(vocab['relation']), d_model=config['t2g']['nhid'], dropout=config['t2g']['drop'])
     return g2t_model, t2g_model
+
 
 def train_g2t_one_step(batch, model, optimizer, config):
     model.train()
@@ -101,6 +53,7 @@ def train_g2t_one_step(batch, model, optimizer, config):
     nn.utils.clip_grad_norm_(model.parameters(), config['clip'])
     optimizer.step()
     return loss.item()
+
 
 def train_t2g_one_step(batch, model, optimizer, config, t2g_weight=None):
     model.train()
@@ -118,6 +71,7 @@ def train_t2g_one_step(batch, model, optimizer, config, t2g_weight=None):
     optimizer.step()
     return loss.item()
 
+
 def t2g_teach_g2t_one_step(raw_batch, model_t2g, model_g2t, optimizer, config, vocab):
     # train a g2t model with the synthetic input from t2g model
     model_t2g.eval()
@@ -131,18 +85,19 @@ def t2g_teach_g2t_one_step(raw_batch, model_t2g, model_g2t, optimizer, config, v
         for e1 in range(len(raw_batch[_i]['ent_text'])):
             for e2 in range(len(raw_batch[_i]['ent_text'])):
                 try:
-                    if sample[e1, e2]!=3 and sample[e1, e2]!=0: # 3 is no relation and 0 is <PAD>
+                    if sample[e1, e2] != 3 and sample[e1, e2] != 0: # 3 is no relation and 0 is <PAD>
                         rel.append([e1, int(sample[e1, e2]), e2])
                 except:
                     logging.warn('{0:}'.format([[vocab['entity'](x) for x in y] for y in raw_batch[_i]['ent_text']]))
                     logging.warn('{0:}'.format(sample.size()))
         _syn = tensor2data_t2g(raw_batch[_i], rel, vocab)
         syn_batch.append(_syn) 
-    if len(syn_batch)==0:
+    if len(syn_batch) == 0:
         return None
     batch_g2t = batch2tensor_g2t(syn_batch, config['g2t']['device'], vocab)
     loss = train_g2t_one_step(batch_g2t, model_g2t, optimizer, config['g2t'])
     return loss
+
 
 def g2t_teach_t2g_one_step(raw_batch, model_g2t, model_t2g, optimizer, config, vocab, t2g_weight=None):
     # train a t2g model with the synthetic input from g2t model
@@ -163,14 +118,15 @@ def g2t_teach_t2g_one_step(raw_batch, model_g2t, model_t2g, optimizer, config, v
     loss = train_t2g_one_step(batch_t2g, model_t2g, optimizer, config['t2g'], t2g_weight=t2g_weight)
     return loss
 
+
 def eval_g2t(pool, _type, vocab, model, config, display=True):
     logging.info('Eval on {0:}'.format(_type))
     model.eval()
     hyp, ref, _same = [], [], []
     unq_hyp = {}
     unq_ref = defaultdict(list)
-    batch_size = 8*config['batch_size']
-    with tqdm.tqdm(list(pool.draw_with_type(batch_size, False, _type)), disable=False if display else True) as tqb:
+    batch_size = 8 * config['batch_size']
+    with tqdm.tqdm(list(pool.draw_with_type(batch_size, False, _type)), disable=(not display)) as tqb:
         for i, _batch in enumerate(tqb):
             with torch.no_grad():
                 batch = batch2tensor_g2t(_batch, config['device'], vocab)
@@ -182,12 +138,14 @@ def eval_g2t(pool, _type, vocab, model, config, display=True):
             ref.extend(r)
         hyp = [x[0] for x in hyp]
         ref = [x[0] for x in ref]
-        idxs, _same= list(zip(*sorted(enumerate(_same), key=lambda x:x[1])))
+        idxs, _same = list(
+            zip(*sorted(enumerate(_same), key=lambda x: x[1]))
+        )
 
         ptr = 0
         for i in range(len(hyp)):
-            if i>0 and _same[i]!=_same[i-1]:
-                ptr +=1
+            if i > 0 and _same[i] !=_same[i - 1]:
+                ptr += 1
             unq_hyp[ptr] = hyp[idxs[i]]
             unq_ref[ptr].append(ref[idxs[i]])
             
@@ -209,8 +167,8 @@ def eval_g2t(pool, _type, vocab, model, config, display=True):
     logging.info('METEOR {0:}'.format(meteor.compute_score(ref, hyp)[0]))
     logging.info('ROUGE_L {0:}'.format(rouge.compute_score(ref, hyp)[0]))
     logging.info('Cider {0:}'.format(cider.compute_score(ref, hyp)[0]))
-
     return ret[0][-1]
+
 
 def eval_t2g(pool, _type, vocab, model, config, display=True):
     # evaluate t2g model
@@ -218,7 +176,7 @@ def eval_t2g(pool, _type, vocab, model, config, display=True):
     hyp, ref, pos_label = [], [], []
     model.eval()
     wf = open('t2g_show.txt', 'w')
-    with tqdm.tqdm(list(pool.draw_with_type(config['batch_size'], False, _type)), disable=False if display else True) as tqb: 
+    with tqdm.tqdm(list(pool.draw_with_type(config['batch_size'], False, _type)), disable=(not display)) as tqb: 
         for i, _batch in enumerate(tqb):
             with torch.no_grad():
                 batch = batch2tensor_t2g(_batch, config['device'], vocab)
@@ -231,27 +189,27 @@ def eval_t2g(pool, _type, vocab, model, config, display=True):
             cnts = []
             for j in range(len(_batch)):
                 _cnt = 0
-                ents = [[y for y in vocab['entity'](x) if y[0]!='<'] for x in _batch[j]['ent_text']]
+                ents = [[y for y in vocab['entity'](x) if y[0] != '<'] for x in _batch[j]['ent_text']]
                 wf.write('=====================\n')
                 rels = [] 
                 for e1 in range(len(ents)):
                     for e2 in range(len(ents)):
-                        if tpred[j, e1, e2]!=3 and tpred[j,e1,e2]!=0:
-                            rels.append((e1,int(tpred[j,e1,e2]), e2))
-                wf.write(str([(ents[e1], vocab['relation'](r), ents[e2]) for e1,r,e2 in rels])+'\n')
+                        if tpred[j, e1, e2] != 3 and tpred[j, e1, e2] != 0:
+                            rels.append((e1,int(tpred[ j, e1, e2]), e2))
+                wf.write(str([(ents[e1], vocab['relation'](r), ents[e2]) for e1, r, e2 in rels]) + '\n')
                 rels = []
                 for e1 in range(len(ents)):
                     for e2 in range(len(ents)):
-                        if tgold[j, e1, e2]!=3 and tgold[j,e1,e2]!=0:
-                            rels.append((e1,int(tgold[j,e1,e2]), e2))
-                        if tgold[j,e1,e2]>0:
+                        if tgold[j, e1, e2] != 3 and tgold[j, e1, e2] != 0:
+                            rels.append((e1, int(tgold[j, e1, e2]), e2))
+                        if tgold[j,  e1, e2] > 0:
                             _cnt += 1
                 wf.write(str([(ents[e1], vocab['relation'](r), ents[e2]) for e1,r,e2 in rels])+'\n')
                 cnts.append(_cnt)
             
             pred, gold = [], []
             for j in range(len(_gold)):
-                if _gold[j]>0: # not the <PAD>
+                if _gold[j] > 0: # not the <PAD>
                     pred.append(_pred[j])
                     gold.append(_gold[j])
             pos_label.extend([x for x in gold if x!=3]) # 3 is no relation
@@ -266,6 +224,7 @@ def eval_t2g(pool, _type, vocab, model, config, display=True):
     logging.info('F1 micro {0:} F1 macro {1:}'.format(f1_micro, f1_macro))
     return f1_micro
 
+
 def warmup_step1(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab):
     model_g2t.blind, model_t2g.blind = True, True
     batch = batch2tensor_t2g(batch_t2g, config['t2g']['device'], vocab)
@@ -274,12 +233,14 @@ def warmup_step1(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optim
     loss2 = train_g2t_one_step(batch, model_g2t, optimizerG2T, config['g2t'])
     return loss1, loss2
 
+
 def warmup_step2(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab):
     model_g2t.blind, model_t2g.blind = True, False
     _loss1 = g2t_teach_t2g_one_step(batch_t2g, model_g2t, model_t2g, optimizerT2G, config, vocab, t2g_weight=t2g_weight)
     model_g2t.blind, model_t2g.blind = False, True
     _loss2 = t2g_teach_g2t_one_step(batch_g2t, model_t2g, model_g2t, optimizerG2T, config, vocab)
     return _loss1, _loss2
+
 
 def supervise(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab):
     model_g2t.blind, model_t2g.blind = False, False
@@ -289,11 +250,13 @@ def supervise(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimize
     _loss2 = train_g2t_one_step(batch, model_g2t, optimizerG2T, config['g2t'])
     return _loss1, _loss2
 
+
 def back_translation(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab):
     model_g2t.blind, model_t2g.blind = False, False
     _loss1 = g2t_teach_t2g_one_step(batch_t2g, model_g2t, model_t2g, optimizerT2G, config, vocab, t2g_weight=t2g_weight)
     _loss2 = t2g_teach_g2t_one_step(batch_g2t, model_t2g, model_g2t, optimizerG2T, config, vocab)
     return _loss1, _loss2
+
 
 def train(_type, config, load='tmp_vocab.pt'):
     dev_id = 0
@@ -305,17 +268,16 @@ def train(_type, config, load='tmp_vocab.pt'):
     model_g2t.to(device)
     model_t2g.to(device)
 
-    from transformers.optimization import get_cosine_schedule_with_warmup , get_linear_schedule_with_warmup	
-    optimizerG2T = torch.optim.Adam(model_g2t.parameters(), lr = config['g2t']['lr'], weight_decay=config['g2t']['weight_decay']) 
+    optimizerG2T = torch.optim.Adam(model_g2t.parameters(), lr=config['g2t']['lr'], weight_decay=config['g2t']['weight_decay']) 
     schedulerG2T = get_cosine_schedule_with_warmup(
-		optimizer = optimizerG2T , 
-		num_warmup_steps = 400 , 
+		optimizer = optimizerG2T, 
+		num_warmup_steps = 400, 
 		num_training_steps = 800 * config['main']['epoch'], 
 	)
     optimizerT2G = torch.optim.Adam(model_t2g.parameters(), lr = config['t2g']['lr'], weight_decay=config['t2g']['weight_decay'])
     schedulerT2G = get_cosine_schedule_with_warmup(
-		optimizer = optimizerT2G , 
-		num_warmup_steps = 400 , 
+		optimizer = optimizerT2G, 
+		num_warmup_steps = 400, 
 		num_training_steps = 800 * config['main']['epoch'], 
 	)
     loss_t2g, loss_g2t = [], []
@@ -325,24 +287,64 @@ def train(_type, config, load='tmp_vocab.pt'):
     t2g_weight[0] = 0
     max_w = max(t2g_weight)
     t2g_weight = np.array(t2g_weight).astype('float32')
-    t2g_weight = (max_w+1000)/(t2g_weight+1000)
+    t2g_weight = (max_w + 1000) / (t2g_weight + 1000)
 
     for i in range(0, config['main']['epoch']):
-        _data_g2t = list(pool.draw_with_type(config['main']['batch_size'], True, _type+'_g2t'))
-        _data_t2g = list(pool.draw_with_type(config['main']['batch_size'], True, _type+'_t2g'))
+        _data_g2t = list(pool.draw_with_type(config['main']['batch_size'], True, _type + '_g2t'))
+        _data_t2g = list(pool.draw_with_type(config['main']['batch_size'], True, _type + '_t2g'))
 
         data_list = list(zip(_data_g2t, _data_t2g))
         _data = data_list
         with tqdm.tqdm(_data, disable=True if not config['main']['display'] else False) as tqb:
             for j, (batch_g2t, batch_t2g) in enumerate(tqb):
-                if i<config['main']['pre_epoch'] and config['main']['mode']=='warm_unsup':
-                    _loss1, _loss2 = warmup_step1(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab)
-                if i==config['main']['pre_epoch']+1 and config['main']['mode']=='warm_unsup':
-                    _loss1, _loss2 = warmup_step2(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab)
-                if config['main']['mode']=='sup':
-                    _loss1, _loss2 = supervise(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab)
-                if (i>=config['main']['pre_epoch']+1 and config['main']['mode']=='warm_unsup') or (config['main']['mode']=='cold_unsup'):
-                    _loss1, _loss2 = back_translation(batch_g2t, batch_t2g, model_g2t, model_t2g, optimizerG2T, optimizerT2G, config, t2g_weight, vocab)
+                if i < config['main']['pre_epoch'] and config['main']['mode'] == 'warm_unsup':
+                    _loss1, _loss2 = warmup_step1(
+                        batch_g2t,
+                        batch_t2g,
+                        model_g2t,
+                        model_t2g,
+                        optimizerG2T,
+                        optimizerT2G,
+                        config,
+                        t2g_weight,
+                        vocab
+                    )
+                if i == config['main']['pre_epoch'] + 1 and config['main']['mode'] == 'warm_unsup':
+                    _loss1, _loss2 = warmup_step2(
+                        batch_g2t, 
+                        batch_t2g, 
+                        model_g2t, 
+                        model_t2g,
+                        optimizerG2T, 
+                        optimizerT2G, 
+                        config, 
+                        t2g_weight, 
+                        vocab
+                    )
+                if config['main']['mode'] == 'sup':
+                    _loss1, _loss2 = supervise(
+                        batch_g2t, 
+                        batch_t2g, 
+                        model_g2t,
+                        model_t2g,
+                        optimizerG2T,
+                        optimizerT2G, 
+                        config, 
+                        t2g_weight, 
+                        vocab
+                    )
+                if (i >= config['main']['pre_epoch'] + 1 and config['main']['mode'] == 'warm_unsup') or (config['main']['mode'] == 'cold_unsup'):
+                    _loss1, _loss2 = back_translation(
+                        batch_g2t, 
+                        batch_t2g, 
+                        model_g2t, 
+                        model_t2g, 
+                        optimizerG2T, 
+                        optimizerT2G, 
+                        config, 
+                        t2g_weight, 
+                        vocab
+                    )
                 loss_t2g.append(_loss1)
                 schedulerT2G.step()
                 loss_g2t.append(_loss2)
@@ -350,8 +352,8 @@ def train(_type, config, load='tmp_vocab.pt'):
                 tqb.set_postfix({'t2g loss': np.mean(loss_t2g), 'g2t loss': np.mean(loss_g2t)})
 
         logging.info('Epoch '+str(i))
-        if i%5==0:
-            if i<config['main']['pre_epoch'] and config['main']['mode']=='warm_unsup':
+        if i % 5 == 0:
+            if i < config['main']['pre_epoch'] and config['main']['mode'] == 'warm_unsup':
                 model_g2t.blind, model_t2g.blind = True, True
             else:
                 model_g2t.blind, model_t2g.blind = False, False
@@ -361,12 +363,12 @@ def train(_type, config, load='tmp_vocab.pt'):
                 e = eval_t2g(pool, 'dev', vocab, model_t2g, config['t2g'], display=config['main']['display'])
             if e > best_t2g:
                 best_t2g = max(best_t2g, e)
-                torch.save(model_t2g.state_dict(), config['t2g']['save']+'X'+'best')
+                torch.save(model_t2g.state_dict(), config['t2g']['save'] + 'X' + 'best')
             e = eval_g2t(pool, 'dev', vocab, model_g2t, config['g2t'], display=config['main']['display'])
             if e > best_g2t:
                 best_g2t = max(best_g2t, e)
                 torch.save(model_g2t.state_dict(), config['g2t']['save']+'X'+'best')
-            if i==config['main']['pre_epoch']:
+            if i == config['main']['pre_epoch']:
                 torch.save(model_t2g.state_dict(), config['t2g']['save']+'X'+'mid')
                 torch.save(model_g2t.state_dict(), config['g2t']['save']+'X'+'mid')
     model_g2t.load_state_dict(torch.load(config['g2t']['save']+'X'+'best'))
@@ -374,6 +376,7 @@ def train(_type, config, load='tmp_vocab.pt'):
     logging.info('Final Test mode {0:}'.format(config['main']['mode']))
     e = eval_t2g(pool, 'test', vocab, model_t2g, config['t2g'])
     e = eval_g2t(pool, 'test', vocab, model_g2t, config['g2t'])
+
 
 def multi_run():
     parser = argparse.ArgumentParser()
@@ -398,6 +401,7 @@ def multi_run():
         vocab= prep_data(config['main'])
         torch.save({'vocab':vocab}, 'tmp_vocab.pt'+str(config['main']['seed']))
         train('train', config, load='tmp_vocab.pt'+str(config['main']['seed']))
+
 
 def main():
     parser = argparse.ArgumentParser()

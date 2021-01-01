@@ -1,28 +1,34 @@
 import torch
 import math
-from data import pad, NODE_TYPE
+from .data.data import pad, NODE_TYPE
 from dgl.nn.pytorch import edge_softmax
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence,pad_packed_sequence
 import torch.utils.data
 
 def replace_ent(x, ent, V, emb):
-    # replace the entity
-    mask = (x>=V).float()
-    _x = emb((x*(1.-mask) + 3 * mask ).long()) # 3 is <UNK>
-    if mask.sum()==0:
+    """
+    Replace the entity in a given sentence with [Ent1] etc...
+    """
+    mask = (x >= V).float()
+    _x = emb((x * (1. - mask) + 3 * mask).long()) # 3 is <UNK>
+    if mask.sum() == 0:
         return _x
-    idx = ((x-V)*mask + 0 * (1.-mask)).long()
-    return _x * (1.-mask[:,None]) + mask[:,None] * ent[torch.arange(len(idx)).cuda(), idx].view(_x.shape)
+    idx = ((x - V) * mask + 0 * (1. - mask)).long()
+    return _x * (1. - mask[:, None]) + mask[:, None] * ent[torch.arange(len(idx)).cuda(), idx].view(_x.shape)
 
 def len2mask(lens, device):
+    """
+    """
     max_len = max(lens)
     mask = torch.arange(max_len, device=device).unsqueeze(0).expand(len(lens), max_len)
     mask = mask >= torch.LongTensor(lens).to(mask).unsqueeze(1)
     return mask
 
 class MSA(nn.Module):
-    # Multi-head Self Attention
+    """
+    Multi-head Self Attention
+    """
     def __init__(self, config, mode='normal'):
         super(MSA, self).__init__()
         if mode=='copy':
@@ -39,6 +45,9 @@ class MSA(nn.Module):
         self.config, self.nhead, self.head_dim, self.mode = config, nhead, head_dim, mode
 
     def forward(self, inp1, inp2, mask=None):
+        """
+        
+        """
         B, L2, H = inp2.shape
         NH, HD = self.nhead, self.head_dim
         if self.mode=='copy':
@@ -125,8 +134,10 @@ class GAT(nn.Module):
         e =  graph.edata.pop('e') / math.sqrt(self._out_feats * self._num_heads)
         graph.edata['a'] = edge_softmax(graph, e).unsqueeze(-1)
        # message passing
-        graph.update_all(fn_u_mul_e('ft', 'a', 'm'),
-                         fn_sum('m', 'ft2'))
+        graph.update_all(
+            fn_u_mul_e('ft', 'a', 'm'),
+            fn_sum('m', 'ft2')
+        )
         rst = graph.ndata['ft2']
         # residual
         rst = rst.view(feat.shape) + feat
@@ -180,8 +191,13 @@ def fn_u_mul_e(n1,n2,n3):
 def fn_sum(n1, n2):
     def func(node_batch):
         return {n2: node_batch.mailbox[n1].sum(1)}
-    return func          
+    return func
+
+
 class GraphWriter(nn.Module):
+    """
+    
+    """
     def __init__(self, config, vocab_pack=None):
         super(GraphWriter, self).__init__()
         if vocab_pack is not None:
@@ -215,6 +231,30 @@ class GraphWriter(nn.Module):
             g_ent, g_root = self.graph_enc(ent_enc, ent_mask, ent_len, rel_emb, rel_mask, batch['graph'])
         return self.ln(g_ent), g_root, ent_enc
 
+
+    def train_forward(self, batch, ent_enc, ent_mask):
+         # training
+        outs = []
+        _mask = (batch['text'] >= len(self.text_vocab)).long()
+        _inp = _mask * 3 + (1 .- _mask) * batch['text'] # 3 is <UNK> 
+        tar_inp = self.tar_emb(_inp.long())
+        encoded = ent_enc[torch.arange(len(batch['text']))[:, None].cuda(), ((batch['text'] - len(self.text_vocab)) * _mask).long()]
+        tar_inp = ((1. - _mask[:, :, None])) * tar_inp + (encoded * _mask[:, :, None])
+        tar_inp = tar_inp.transpose(0, 1)
+        for t, xt in enumerate(tar_inp):
+            _xt = torch.cat([ctx, xt], 1)
+            _h, _c = self.decode_lstm(_xt, (_h, _c))
+            ctx = _h + self.ent_attn(_h, g_ent, mask=ent_mask)
+            outs.append(torch.cat([_h, ctx], 1))
+        outs = torch.stack(outs, 1)
+        copy_gate = torch.sigmoid(self.copy_fc(outs))
+        EPSI = 1e-6
+        # copy
+        pred_v = torch.log(copy_gate+EPSI) + torch.log_softmax(self.pred_v_fc(outs), -1)
+        pred_c = torch.log((1. - copy_gate)+EPSI) + torch.log_softmax(self.copy_attn(outs, ent_enc, mask=ent_mask), -1)
+        pred = torch.cat([pred_v, pred_c], -1)
+        return pred, torch.exp(pred_c)
+
     def forward(self, batch, beam_size=-1):
         # three modes, beam_size==-1 means training, beam_size==1 means greedy decoding, and beam_size>1 means beam search
         ent_mask = len2mask(batch['ent_len'], batch['ent_text'].device)
@@ -225,28 +265,8 @@ class GraphWriter(nn.Module):
 
         _h, _c = g_root, g_root.clone().detach()
         ctx = _h + self.ent_attn(_h, g_ent, mask=ent_mask)
-        if beam_size<1:
-            # training
-            outs = []
-            _mask = (batch['text']>=len(self.text_vocab)).long()
-            _inp = _mask * 3 + (1.-_mask) * batch['text'] # 3 is <UNK> 
-            tar_inp = self.tar_emb(_inp.long())
-            tar_inp = (1.-_mask[:,:,None]) * tar_inp +  ent_enc[torch.arange(len(batch['text']))[:,None].cuda(),((batch['text']-len(self.text_vocab)) * _mask ).long()] * _mask[:,:,None]
-
-            tar_inp = tar_inp.transpose(0,1)
-            for t, xt in enumerate(tar_inp):
-                _xt = torch.cat([ctx, xt], 1)
-                _h, _c = self.decode_lstm(_xt, (_h, _c))
-                ctx = _h + self.ent_attn(_h, g_ent, mask=ent_mask)
-                outs.append(torch.cat([_h, ctx], 1))
-            outs = torch.stack(outs, 1)
-            copy_gate = torch.sigmoid(self.copy_fc(outs))
-            EPSI = 1e-6
-            # copy
-            pred_v = torch.log(copy_gate+EPSI) + torch.log_softmax(self.pred_v_fc(outs), -1)
-            pred_c = torch.log((1. - copy_gate)+EPSI) + torch.log_softmax(self.copy_attn(outs, ent_enc, mask=ent_mask), -1)
-            pred = torch.cat([pred_v, pred_c], -1)
-            return pred, torch.exp(pred_c)
+        if beam_size < 1:
+           
         else:
             if beam_size==1:
                 # greedy

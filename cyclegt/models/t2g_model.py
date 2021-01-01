@@ -2,7 +2,11 @@ import torch as tc
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class ModelLSTM(nn.Module):
+        """
+        Text-to-graph model. LSTM that produces a graph
+        """
         def __init__(self , relation_types = 7 , dropout = 0.0, d_model=768):
                 super().__init__()
 
@@ -12,8 +16,8 @@ class ModelLSTM(nn.Module):
 
                 self.emb = nn.Embedding(40000, self.d_model) # 40000 because we use the Bert tokenizer
                 self.lstm = nn.LSTM(self.d_model, self.d_model//2, batch_first=True, bidirectional=True, num_layers=2)
-                self.wq = nn.Linear(self.d_model , self.d_model)
-                self.wk = nn.Linear(self.d_model , self.d_model)
+                self.wq = nn.Linear(self.d_model , self.d_model) # ??
+                self.wk = nn.Linear(self.d_model , self.d_model) # ??
                 self.drop = nn.Dropout(self.dropout)
                 self.ln1 = nn.Linear(self.d_model , self.d_model)
                 self.lno = nn.Linear(self.d_model , relation_types)
@@ -35,7 +39,6 @@ class ModelLSTM(nn.Module):
 
         def forward(self , batch):
                 d = self.d_model
-
                 sents = batch['sents']
                 ents = batch['ents']
                 if self.blind: #blind means using entity only
@@ -44,7 +47,6 @@ class ModelLSTM(nn.Module):
                     s = sents
                 bs , n = sents.size()
                 ne = max([len(x) for x in ents])
-
                 ent_index = s.new_zeros(s.size())
                 for _b in range(len(ents)):
                         for u,v in ents[_b]:
@@ -52,7 +54,7 @@ class ModelLSTM(nn.Module):
                                 if self.blind:
                                     s[_b, u:v] = sents[_b, u:v]
 
-                sent_mask  = (s != 0)
+                sent_mask = (s != 0)
 
                 encoded, _ = self.lstm(self.emb(s))
                 ent_mask = sent_mask.new_zeros(bs, ne).float()

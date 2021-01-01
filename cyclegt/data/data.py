@@ -4,12 +4,17 @@ import uuid
 import copy
 import random
 from transformers import BertTokenizer
+
+
 bert_type = "bert-base-uncased"
 tokenizer = BertTokenizer.from_pretrained(bert_type)
-
 NODE_TYPE = {'entity': 0, 'root': 1, 'relation':2}
+
+
 def pad(var_len_list, out_type='list', flatten=False):
-    #padding sequences
+    """
+    Padding sequences.
+    """
     if flatten:
         lens = [len(x) for x in var_len_list]
         var_len_list = sum(var_len_list, [])
@@ -26,6 +31,7 @@ def pad(var_len_list, out_type='list', flatten=False):
         else:
             return torch.stack([torch.cat([x, \
             torch.zeros([max_len-len(x)]+list(x.shape[1:])).type_as(x)], 0) for x in var_len_list], 0)
+
 
 def write_txt(batch, seqs, text_vocab):
     # converting the prediction to real text.
@@ -52,6 +58,7 @@ def write_txt(batch, seqs, text_vocab):
                 break
         ret.append([' '.join([str(x) for x in txt]).replace('<BOS>', '').replace('<EOS>', '')])
     return ret
+
 
 class Vocab(object):
     def __init__(self, max_vocab=2**31, min_freq=-1, sp=['<PAD>', '<BOS>', '<EOS>', '<UNK>', '<ROOT>']):
@@ -113,9 +120,8 @@ class Vocab(object):
 
 def scan_data(datas, vocab=None, sp=False):
     MF = -1
-
     if vocab is None:
-        vocab = {'text':Vocab(min_freq=MF), 'entity':Vocab(min_freq=MF), 'relation':Vocab()}
+        vocab = {'text': Vocab(min_freq=MF), 'entity': Vocab(min_freq=MF), 'relation': Vocab()}
     for data in datas:
         vocab['text'].update(data['text'].split(), sp=sp)
         vocab['entity'].update(sum(data['entities'], []), sp=sp)
@@ -124,33 +130,37 @@ def scan_data(datas, vocab=None, sp=False):
 
 def get_graph(ent_len, rel_len, adj_edges):
     graph = dgl.DGLGraph()
-
-    graph.add_nodes(ent_len,
-                    {'type': torch.ones(ent_len) * NODE_TYPE['entity']})
+    graph.add_nodes(
+        ent_len,
+        {'type': torch.ones(ent_len) * NODE_TYPE['entity']
+    })
     graph.add_nodes(1, {'type': torch.ones(1) * NODE_TYPE['root']})
-    graph.add_nodes(rel_len * 2,
-                    {'type': torch.ones(rel_len * 2) * NODE_TYPE['relation']})
+    graph.add_nodes(
+        rel_len * 2,
+        {'type': torch.ones(rel_len * 2) * NODE_TYPE['relation']
+    })
     graph.add_edges(ent_len, torch.arange(ent_len))
     graph.add_edges(torch.arange(ent_len), ent_len)
-    graph.add_edges(torch.arange(ent_len + 1 + rel_len * 2),
-                    torch.arange(ent_len + 1 + rel_len * 2))
-
+    graph.add_edges(
+        torch.arange(ent_len + 1 + rel_len * 2),
+        torch.arange(ent_len + 1 + rel_len * 2)
+    )
     if len(adj_edges) > 0:
-        graph.add_edges(*list(map(list, zip(*adj_edges))))
+        graph.add_edges(
+            *list(map(list, zip(*adj_edges)))
+        )
     return graph
 
 def build_graph(ent_len, relations):
     rel_len = len(relations)
-
     adj_edges = []
     for i, r in enumerate(relations):
         st_ent, rt, ed_ent = r
         # according to the edge_softmax operator, we need to reverse the graph
-        adj_edges.append([ent_len+1+2*i, st_ent])
-        adj_edges.append([ed_ent, ent_len+1+2*i])
-        adj_edges.append([ent_len+1+2*i+1, ed_ent])
-        adj_edges.append([st_ent, ent_len+1+2*i+1])
-
+        adj_edges.append([ent_len+1 + 2*i, st_ent])
+        adj_edges.append([ed_ent, ent_len + 1 + 2*i])
+        adj_edges.append([ent_len + 1 + 2*i + 1, ed_ent])
+        adj_edges.append([st_ent, ent_len + 1 +2*i +1])
     graph = get_graph(ent_len, rel_len, adj_edges)
     return graph
 
@@ -257,6 +267,7 @@ def tensor2data_g2t(old_data, pred):
     new_data['uuid'] = old_data['uuid']
     return new_data
 
+
 def tensor2data_t2g(old_data, pred, vocab):
     # construct synthetic data based on the old data and model prediction
     new_data = {}
@@ -266,6 +277,7 @@ def tensor2data_t2g(old_data, pred, vocab):
     new_data['graph'] = build_graph(len(new_data['ent_text']), pred)
     new_data['uuid'] = old_data['uuid']
     return new_data
+
 
 def batch2tensor_t2g(datas, device, vocab, add_inp=False):
     # raw batch to tensor, we use the Bert tokenizer for the T2G model
@@ -338,8 +350,66 @@ def batch2tensor_t2g(datas, device, vocab, add_inp=False):
     ret['tgt'] = torch.stack(tgt,0)[:,:ent_len,:ent_len].long().to(device)
     return ret
 
+
 def fill_pool(pool, vocab, datas, _type):
     for data in datas:
         ex = Example(data, vocab).get()
         pool.add(ex, _type)
 
+
+def fake_sent(x):
+    return ' '.join(['<ENT_{0:}>'.format(xx) for xx in range(len(x))])
+
+
+def prep_data(config, load=""):
+    """
+    Prep data always has two steps: 1) Build the vocabulary and then generate data samples
+    """
+    train_raw = json.load(open(config['train_file'], 'r'))
+    max_len = sorted([len(x['text'].split()) for x in train_raw])[int(0.95*len(train_raw))]
+    train_raw = [x for x in train_raw if len(x['text'].split())<max_len]
+    train_raw = train_raw[:int(len(train_raw)*config['split'])]
+    dev_raw = json.load(open(config['dev_file'], 'r'))
+    test_raw = json.load(open(config['test_file'], 'r'))
+    if len(load) == 0:
+        # scan the data and create vocabulary
+        vocab = scan_data(train_raw)
+        vocab = scan_data(dev_raw, vocab)
+        vocab = scan_data(test_raw, vocab, sp=True)
+        for v in vocab.values():
+            v.build()
+            logging.info('Vocab Size {0:}, detached by test set {1:}'.format(len(v), len(v.sp)))
+        return vocab
+    else:
+        vocab = torch.load(load)['vocab']
+    logging.info('MAX_LEN {0:}'.format(max_len))
+    pool = DataPool()
+    _raw = []
+    for x in train_raw:
+        _x = copy.deepcopy(x)
+        if config['mode']=='sup':
+            _raw.append(_x)
+        else: #make sure that no information leak in unsupervised settings
+            _x['relations'] = []
+            _raw.append(_x)
+    fill_pool(pool, vocab, _raw, 'train_g2t')
+    _raw = []
+    for x in train_raw:
+        _x = copy.deepcopy(x)
+        if config['mode']=='sup':
+            _raw.append(_x)
+        else: #make sure that no information leak in unsupervised settings
+            _x['text'] = fake_sent(_x['entities'])
+            _raw.append(_x)
+
+    fill_pool(pool, vocab, _raw, 'train_t2g')
+    _raw = []
+    for x in dev_raw:
+        _x = copy.deepcopy(x)
+        _x['text'] = fake_sent(_x['entities'])
+        _raw.append(_x)
+
+    fill_pool(pool, vocab, dev_raw, 'dev')
+    fill_pool(pool, vocab, _raw, 'dev_t2g_blind') # prepare for the entity2graph setting
+    fill_pool(pool, vocab, test_raw, 'test')
+    return pool, vocab
